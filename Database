@@ -1,0 +1,332 @@
+import sqlite3
+import json
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
+class Database:
+    def __init__(self, db_path='whatsay.db'):
+        self.db_path = db_path
+        self.init_db()
+    
+    def get_connection(self):
+        """Get database connection"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def init_db(self):
+        """Initialize database tables"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Users table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                language TEXT DEFAULT 'en',
+                free_credits INTEGER DEFAULT 12,
+                purchased_credits INTEGER DEFAULT 0,
+                subscription_tier TEXT DEFAULT NULL,
+                subscription_credits INTEGER DEFAULT 0,
+                credits_expiry TIMESTAMP,
+                total_used INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Conversations table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                incoming_message TEXT,
+                responses TEXT,
+                tone TEXT,
+                language TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+        
+        # Usage stats table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS usage_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action TEXT,
+                credits_used INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+        
+        # Payments table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                credits INTEGER,
+                payment_type TEXT,
+                stripe_id TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def create_user(self, user_id: int, username: str, language: str = 'en'):
+        """Create new user with free credits"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        expiry = datetime.now() + timedelta(days=7)
+        
+        cursor.execute('''
+            INSERT INTO users (user_id, username, language, free_credits, credits_expiry)
+            VALUES (?, ?, ?, 12, ?)
+        ''', (user_id, username, language, expiry))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_user(self, user_id: int) -> Optional[Dict]:
+        """Get user data"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return dict(row)
+        return None
+    
+    def update_user_language(self, user_id: int, language: str):
+        """Update user's interface language"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE users SET language = ?, last_active = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+        ''', (language, user_id))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_credits(self, user_id: int) -> Dict:
+        """Get user's credit balance"""
+        user = self.get_user(user_id)
+        if not user:
+            return {'free': 0, 'purchased': 0, 'subscription': 0, 'total': 0}
+        
+        # Check if free credits expired
+        free_credits = user['free_credits']
+        if user['credits_expiry']:
+            expiry = datetime.fromisoformat(user['credits_expiry'])
+            if datetime.now() > expiry:
+                free_credits = 0
+                self._expire_free_credits(user_id)
+        
+        subscription_credits = user.get('subscription_credits', 0)
+        purchased_credits = user['purchased_credits']
+        
+        total = free_credits + purchased_credits + subscription_credits
+        
+        return {
+            'free': free_credits,
+            'purchased': purchased_credits,
+            'subscription': subscription_credits,
+            'total': total
+        }
+    
+    def _expire_free_credits(self, user_id: int):
+        """Expire free credits"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE users SET free_credits = 0 WHERE user_id = ?
+        ''', (user_id,))
+        
+        conn.commit()
+        conn.close()
+    
+    def use_credit(self, user_id: int) -> bool:
+        """Deduct one credit from user"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Get current credits
+        credits = self.get_credits(user_id)
+        
+        if credits['total'] <= 0:
+            conn.close()
+            return False
+        
+        # Deduct in order: free -> subscription -> purchased
+        if credits['free'] > 0:
+            cursor.execute('''
+                UPDATE users 
+                SET free_credits = free_credits - 1,
+                    total_used = total_used + 1,
+                    last_active = CURRENT_TIMESTAMP
+                WHERE user_id = ?
+            ''', (user_id,))
+        elif credits['subscription'] > 0:
+            cursor.execute('''
+                UPDATE users 
+                SET subscription_credits = subscription_credits - 1,
+                    total_used = total_used + 1,
+                    last_active = CURRENT_TIMESTAMP
+                WHERE user_id = ?
+            ''', (user_id,))
+        else:
+            cursor.execute('''
+                UPDATE users 
+                SET purchased_credits = purchased_credits - 1,
+                    total_used = total_used + 1,
+                    last_active = CURRENT_TIMESTAMP
+                WHERE user_id = ?
+            ''', (user_id,))
+        
+        # Log usage
+        cursor.execute('''
+            INSERT INTO usage_stats (user_id, action)
+            VALUES (?, 'generate_response')
+        ''', (user_id,))
+        
+        conn.commit()
+        conn.close()
+        return True
+    
+    def add_credits(self, user_id: int, amount: int, credit_type: str = 'purchased'):
+        """Add credits to user"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        if credit_type == 'purchased':
+            cursor.execute('''
+                UPDATE users 
+                SET purchased_credits = purchased_credits + ?
+                WHERE user_id = ?
+            ''', (amount, user_id))
+        elif credit_type == 'subscription':
+            cursor.execute('''
+                UPDATE users 
+                SET subscription_credits = subscription_credits + ?
+                WHERE user_id = ?
+            ''', (amount, user_id))
+        
+        conn.commit()
+        conn.close()
+    
+    def save_conversation(self, user_id: int, incoming_message: str, 
+                         responses: List[str], tone: str, language: str):
+        """Save conversation to history"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        responses_json = json.dumps(responses)
+        
+        cursor.execute('''
+            INSERT INTO conversations (user_id, incoming_message, responses, tone, language)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, incoming_message, responses_json, tone, language))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_conversation_history(self, user_id: int, limit: int = 10) -> List[Dict]:
+        """Get user's conversation history"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT * FROM conversations
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+        ''', (user_id, limit))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        history = []
+        for row in rows:
+            history.append({
+                'id': row['id'],
+                'message': row['incoming_message'],
+                'responses': json.loads(row['responses']),
+                'tone': row['tone'],
+                'language': row['language'],
+                'created_at': row['created_at']
+            })
+        
+        return history
+    
+    def get_user_stats(self, user_id: int) -> Dict:
+        """Get user statistics"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        user = self.get_user(user_id)
+        if not user:
+            return {'total_used': 0, 'used_this_month': 0, 'days_active': 1}
+        
+        # Get usage this month
+        cursor.execute('''
+            SELECT COUNT(*) as count FROM usage_stats
+            WHERE user_id = ?
+            AND created_at >= date('now', 'start of month')
+        ''', (user_id,))
+        
+        month_usage = cursor.fetchone()['count']
+        
+        # Calculate days active
+        created_at = datetime.fromisoformat(user['created_at'])
+        days_active = max((datetime.now() - created_at).days, 1)
+        
+        conn.close()
+        
+        return {
+            'total_used': user['total_used'],
+            'used_this_month': month_usage,
+            'days_active': days_active
+        }
+    
+    def record_payment(self, user_id: int, amount: float, credits: int, 
+                      payment_type: str, stripe_id: str = None):
+        """Record a payment"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO payments (user_id, amount, credits, payment_type, stripe_id, status)
+            VALUES (?, ?, ?, ?, ?, 'completed')
+        ''', (user_id, amount, credits, payment_type, stripe_id))
+        
+        conn.commit()
+        conn.close()
+    
+    def update_subscription(self, user_id: int, tier: str, credits: int):
+        """Update user's subscription"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE users 
+            SET subscription_tier = ?,
+                subscription_credits = subscription_credits + ?
+            WHERE user_id = ?
+        ''', (tier, credits, user_id))
+        
+        conn.commit()
+        conn.close()
